@@ -14,5 +14,9 @@ public enum EventType {
     /** 超出应还部分挂账。 */
     SUSPENSE_HELD,
     /** 挂账款申请冲抵应还。 */
-    SUSPENSE_APPLIED
+    SUSPENSE_APPLIED,
+    /** 一笔已成功受理的还款被撤销（红冲），属性带原还款 requestId 因果链。 */
+    PAYMENT_REVERSED,
+    /** 撤销请求被拒绝（找不到目标还款/重复撤销/无法安全回退等），无账务变动。 */
+    PAYMENT_REVERSAL_REJECTED
 }

@@ -26,5 +26,11 @@ public interface LoanRepository {
     /** 在贷款级独占锁内修改并保存，action 内的所有改动在同一临界区完成。 */
     void updateLocked(String loanId, Consumer<Loan> action);
 
+    /**
+     * 在贷款级独占锁内用 {@code replacement} 整体替换该贷款聚合（撤销台账重放使用）。
+     * 替换动作与“读取旧账本、决定撤销”处于同一临界区，保证不会与后续还款/冲抵交错。
+     */
+    void replaceLocked(String loanId, Loan replacement);
+
     List<String> allLoanIds();
 }

@@ -74,6 +74,23 @@ public class InMemoryLoanRepository implements LoanRepository {
     }
 
     @Override
+    public void replaceLocked(String loanId, Loan replacement) {
+        Lock lock = lockFor(loanId);
+        lock.lock();
+        try {
+            if (!loans.containsKey(loanId)) {
+                throw new IllegalArgumentException("loan not found: " + loanId);
+            }
+            if (!loanId.equals(replacement.getLoanId())) {
+                throw new IllegalArgumentException("replacement loanId mismatch");
+            }
+            loans.put(loanId, replacement);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
     public List<String> allLoanIds() {
         return new ArrayList<>(loans.keySet());
     }

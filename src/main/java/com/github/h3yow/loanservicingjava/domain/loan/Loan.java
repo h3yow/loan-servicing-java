@@ -365,6 +365,83 @@ public final class Loan {
         return allocation;
     }
 
+    /**
+     * 撤销（冲正）一笔或多笔历史成功还款：以同一份合同计划构建一个全新账本，
+     * 按真实落账顺序重放 {@code operations}（已剔除“被撤销还款”及历史上已撤销的还款），
+     * 再以 {@code asOf} 补提罚息、重算分期/贷款状态与账龄。
+     *
+     * <p>相比“在原账本上做减法”，重放会让后续还款/挂账冲抵在科目瀑布中重新就座，
+     * 结果与“这笔还款从没发生过”逐字段一致；由于每一步都由同一套分摊纯函数生成，
+     * 数学上不可能出现负余额或透支。原始历史流水保持不变，本方法只在重放账本上
+     * 追加一条 {@link EventType#PAYMENT_REVERSED} 事件（带被撤销还款因果链）。
+     *
+     * @param operations        按 occurredAt 排好序的真实历史账务操作（调用方已剔除被撤销项）。
+     * @param excludedRequestIds 本次及历史上被撤销的还款 requestId（防御性二次过滤）。
+     * @return 重放后的全新账本（调用方在贷款锁内用它整体替换旧聚合）。
+     */
+    public Loan replayWithout(List<LedgerOperation> operations,
+                              java.util.Set<String> excludedRequestIds,
+                              String targetPaymentRequestId, Money targetRequestedAmount,
+                              String reversalRequestId, LocalDate asOf) {
+        Objects.requireNonNull(operations, "operations");
+        Objects.requireNonNull(excludedRequestIds, "excludedRequestIds");
+        Objects.requireNonNull(reversalRequestId, "reversalRequestId");
+        Objects.requireNonNull(asOf, "asOf");
+
+        // 1) 用完全相同的合同参数与计划重建一个干净账本（不发 LOAN_CREATED 事件）。
+        //    分期必须逐字段深拷贝：Installment 是聚合内可变实体，浅拷贝会让重放污染旧账本。
+        List<Installment> freshSchedule = installments.stream()
+                .map(Installment::freshForReplay)
+                .toList();
+        Loan rebuilt = new Loan(loanId, penaltyRateBps, graceDays, freshSchedule);
+        rebuilt.version = this.version;
+
+        // 2) 严格按历史顺序重放保留下来的现金动作（计提/状态推进内嵌在原流程同序位置）
+        for (LedgerOperation op : operations) {
+            if (excludedRequestIds.contains(op.requestId())) {
+                continue;
+            }
+            if (op instanceof LedgerOperation.Payment p) {
+                rebuilt.accruePenalty(p.asOf());
+                rebuilt.refreshOverdueStatus(p.asOf());
+                PaymentAllocation allocation = rebuilt.computeAllocation(p.amount(), p.asOf());
+                rebuilt.commitAllocation(allocation, p.requestId(), p.asOf());
+                if (allocation.remaining().isPositive()) {
+                    rebuilt.holdSuspense(allocation.remaining(), p.requestId(), p.asOf());
+                }
+            } else if (op instanceof LedgerOperation.SuspenseSweep s) {
+                if (!rebuilt.suspenseBalance.isZero()) {
+                    rebuilt.accruePenalty(s.asOf());
+                    rebuilt.refreshOverdueStatus(s.asOf());
+                    rebuilt.applySuspense(s.requestId(), s.asOf());
+                }
+            }
+            rebuilt.drainEvents();
+        }
+
+        // 3) 撤销日口径：补提尾部罚息并重算状态/账龄（与正常日终判定同序，同日重复幂等）
+        rebuilt.accruePenalty(asOf);
+        rebuilt.refreshOverdueStatus(asOf);
+        rebuilt.drainEvents();
+
+        // 4) 仅追加撤销事件：保留因果链与撤销后快照
+        rebuilt.record(DomainEvent.builder(EventType.PAYMENT_REVERSED)
+                .businessDate(asOf)
+                .requestId(reversalRequestId)
+                .summary("还款被撤销，台账按‘该笔还款从未发生’重放重建")
+                .attr("reversedPaymentRequestId", targetPaymentRequestId)
+                .attr("reversedRequestedAmount", targetRequestedAmount)
+                .attr("suspenseAfter", rebuilt.suspenseBalance)
+                .attr("unpaidPrincipalAfter", rebuilt.unpaidPrincipal())
+                .attr("unpaidInterestAfter", rebuilt.unpaidInterest())
+                .attr("unpaidPenaltyAfter", rebuilt.unpaidPenalty())
+                .attr("replayedOperationCount", operations.stream()
+                        .filter(o -> !excludedRequestIds.contains(o.requestId())).count())
+                .build(), asOf);
+        rebuilt.version++;
+        return rebuilt;
+    }
+
     private void record(DomainEvent event, LocalDate businessDate) {
         pendingEvents.add(new DomainEvent(event.eventId(), event.type(), loanId,
                 event.requestId(), businessDate, event.occurredAt(),

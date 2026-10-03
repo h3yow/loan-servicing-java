@@ -9,11 +9,16 @@ import com.github.h3yow.loanservicingjava.service.OverdueService;
 import com.github.h3yow.loanservicingjava.service.PaymentService;
 import com.github.h3yow.loanservicingjava.service.ReconciliationReport;
 import com.github.h3yow.loanservicingjava.service.ReconciliationService;
+import com.github.h3yow.loanservicingjava.service.ReversalService;
+import com.github.h3yow.loanservicingjava.domain.reversal.ReversalCommand;
+import com.github.h3yow.loanservicingjava.domain.reversal.ReversalResult;
 import com.github.h3yow.loanservicingjava.web.dto.AssessRequest;
 import com.github.h3yow.loanservicingjava.web.dto.CreateLoanRequest;
 import com.github.h3yow.loanservicingjava.web.dto.LoanView;
 import com.github.h3yow.loanservicingjava.web.dto.PaymentRequest;
 import com.github.h3yow.loanservicingjava.web.dto.PaymentResultView;
+import com.github.h3yow.loanservicingjava.web.dto.ReversalRequest;
+import com.github.h3yow.loanservicingjava.web.dto.ReversalResultView;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -37,16 +42,19 @@ public class LoanController {
     private final PaymentService paymentService;
     private final OverdueService overdueService;
     private final ReconciliationService reconciliationService;
+    private final ReversalService reversalService;
     private final EventStore eventStore;
 
     public LoanController(LoanService loanService, PaymentService paymentService,
                           OverdueService overdueService,
                           ReconciliationService reconciliationService,
+                          ReversalService reversalService,
                           EventStore eventStore) {
         this.loanService = loanService;
         this.paymentService = paymentService;
         this.overdueService = overdueService;
         this.reconciliationService = reconciliationService;
+        this.reversalService = reversalService;
         this.eventStore = eventStore;
     }
 
@@ -93,6 +101,16 @@ public class LoanController {
         PaymentResult result = paymentService.applySuspense(loanId, requestId,
                 asOf == null ? LocalDate.now() : asOf);
         return PaymentResultView.from(result);
+    }
+
+    /** 撤销（冲正）一笔已成功受理的还款：重复撤销、并发冲突、拒绝均为可区分结果码。 */
+    @PostMapping("/{loanId}/payments/reversal")
+    public ReversalResultView reversePayment(@PathVariable String loanId,
+                                             @RequestBody ReversalRequest request) {
+        ReversalResult result = reversalService.reverse(new ReversalCommand(
+                request.requestId(), loanId, request.targetPaymentRequestId(),
+                request.asOf() == null ? LocalDate.now() : request.asOf()));
+        return ReversalResultView.from(result);
     }
 
     /** 对账：逐科目恒等式核对。 */

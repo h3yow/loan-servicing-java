@@ -168,6 +168,14 @@ public final class Installment {
         }
     }
 
+    /**
+     * 产出一个合同字段相同、账务/状态字段全部归零的全新分期（撤销台账重放时使用）。
+     * 新分期与原分期不共享任何可变状态，由重放按保留下来的历史操作重新落账。
+     */
+    Installment freshForReplay() {
+        return new Installment(installmentNo, dueDate, scheduledPrincipal, scheduledInterest);
+    }
+
     /** 按业务日期与宽限期重算分期状态、逾期天数与账龄桶，返回桶是否发生变化。 */
     boolean refreshStatus(LocalDate asOf, int graceDays) {
         Bucket oldBucket = this.bucket;
