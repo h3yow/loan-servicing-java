@@ -113,13 +113,13 @@ public class PaymentService {
                     requestId, dueBefore, requested,
                     allocation.applied(), allocation.remaining(), allocation.hasShortfall());
 
-            loan.commitAllocation(allocation, requestId, asOf);
+            // 成功落账（科目分摊 + 必要时挂账）并在聚合台账留痕，供后续撤销重放
+            loan.acceptPaymentEntry(allocation, requestId, asOf);
 
             PaymentOutcome outcome;
             Money suspenseHeld = Money.ZERO;
             String message;
             if (allocation.hasSurplus()) {
-                loan.holdSuspense(allocation.remaining(), requestId, asOf);
                 suspenseHeld = allocation.remaining();
                 outcome = PaymentOutcome.ACCEPTED_SUSPENSE;
                 message = allocation.applied().isZero()

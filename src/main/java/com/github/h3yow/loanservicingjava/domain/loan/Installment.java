@@ -168,6 +168,23 @@ public final class Installment {
         }
     }
 
+    /**
+     * 撤销重放前把分期恢复到放款时的初始状态：科目已还/已计提清零、罚息锚点与首次逾期日清空、
+     * 状态与账龄归位。计划值（scheduledPrincipal/scheduledInterest、dueDate）保持不变。
+     * 仅供 {@link Loan#reversePayment} 在重建聚合状态时调用。
+     */
+    void replayReset() {
+        this.paidPrincipal = Money.ZERO;
+        this.paidInterest = Money.ZERO;
+        this.accruedPenalty = Money.ZERO;
+        this.paidPenalty = Money.ZERO;
+        this.lastPenaltyAccrualDate = null;
+        this.firstOverdueDate = null;
+        this.status = InstallmentStatus.PENDING;
+        this.bucket = Bucket.CURRENT;
+        this.overdueDays = 0L;
+    }
+
     /** 按业务日期与宽限期重算分期状态、逾期天数与账龄桶，返回桶是否发生变化。 */
     boolean refreshStatus(LocalDate asOf, int graceDays) {
         Bucket oldBucket = this.bucket;
