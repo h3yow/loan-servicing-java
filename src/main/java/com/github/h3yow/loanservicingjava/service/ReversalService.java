@@ -55,6 +55,28 @@ public class ReversalService {
         this.eventStore = eventStore;
     }
 
+    /**
+     * Web 边界入口：先校验原始入参，非法输入统一返回 {@link ReversalOutcome#REJECTED_REQUEST_INVALID}
+     * 业务结果，不抛异常、不触碰任何存储（幂等表/事件流水/台账一律不变）。
+     * 非法请求不落幂等记录：同一 requestId 修正参数后重新提交可按正常请求处理。
+     */
+    public ReversalResult reverse(String requestId, String loanId,
+                                  String targetPaymentRequestId, LocalDate asOf) {
+        String violation = ReversalCommand.validate(requestId, loanId, targetPaymentRequestId, asOf);
+        if (violation != null) {
+            log.info("[撤销拒绝] reversalRequestId={}, loanId={}, target={}, outcome={}, reason={}",
+                    requestId, loanId, targetPaymentRequestId,
+                    ReversalOutcome.REJECTED_REQUEST_INVALID, violation);
+            return new ReversalResult(requestId, loanId, targetPaymentRequestId,
+                    ReversalOutcome.REJECTED_REQUEST_INVALID,
+                    "撤销请求本身不合法（" + violation + "），未做任何账务处理；"
+                            + "请补全 requestId/targetPaymentRequestId 等必填字段后重试",
+                    Money.ZERO, Money.ZERO, Money.ZERO, Money.ZERO, Money.ZERO, Money.ZERO,
+                    null, List.of(), asOf, false);
+        }
+        return reverse(new ReversalCommand(requestId, loanId, targetPaymentRequestId, asOf));
+    }
+
     /** 撤销一笔已成功受理的还款；成功、重复撤销、并发冲突、拒绝均返回可区分结果。 */
     public ReversalResult reverse(ReversalCommand command) {
         log.info("[撤销请求] reversalRequestId={}, loanId={}, targetPaymentRequestId={}, asOf={}",

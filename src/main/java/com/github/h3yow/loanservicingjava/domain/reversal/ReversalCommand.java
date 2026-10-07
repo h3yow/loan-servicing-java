@@ -1,7 +1,6 @@
 package com.github.h3yow.loanservicingjava.domain.reversal;
 
 import java.time.LocalDate;
-import java.util.Objects;
 
 /**
  * 撤销命令（对一笔已成功受理的还款发起冲正）。
@@ -18,16 +17,32 @@ public record ReversalCommand(
         LocalDate asOf) {
 
     public ReversalCommand {
-        Objects.requireNonNull(requestId, "requestId");
-        Objects.requireNonNull(loanId, "loanId");
-        Objects.requireNonNull(targetPaymentRequestId, "targetPaymentRequestId");
-        Objects.requireNonNull(asOf, "asOf");
-        if (requestId.isBlank()) {
-            throw new IllegalArgumentException("requestId must not be blank");
+        String violation = validate(requestId, loanId, targetPaymentRequestId, asOf);
+        if (violation != null) {
+            throw new IllegalArgumentException(violation);
         }
-        if (targetPaymentRequestId.isBlank()) {
-            throw new IllegalArgumentException("targetPaymentRequestId must not be blank");
+    }
+
+    /**
+     * 入参合法性校验：全部通过返回 null，否则返回第一条违规原因。
+     * 供服务层在构造命令前预检，把“请求本身不合法”映射为
+     * {@link ReversalOutcome#REJECTED_REQUEST_INVALID} 业务结果而非异常。
+     */
+    public static String validate(String requestId, String loanId,
+                                  String targetPaymentRequestId, LocalDate asOf) {
+        if (requestId == null || requestId.isBlank()) {
+            return "requestId 缺失或为空白";
         }
+        if (loanId == null || loanId.isBlank()) {
+            return "loanId 缺失或为空白";
+        }
+        if (targetPaymentRequestId == null || targetPaymentRequestId.isBlank()) {
+            return "targetPaymentRequestId 缺失或为空白";
+        }
+        if (asOf == null) {
+            return "asOf 缺失";
+        }
+        return null;
     }
 
     /** 撤销请求指纹：同一 requestId 以不同贷款/不同目标还款重放必须被识别。 */

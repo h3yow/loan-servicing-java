@@ -198,13 +198,34 @@ SUSPENSE_HELD / SUSPENSE_APPLIED / PAYMENT_REVERSED / PAYMENT_REVERSAL_REJECTED`
 | `CONFLICT_CONCURRENT` | 同一撤销 `requestId` 的另一请求正在处理中 | 否 |
 | `REJECTED_ALREADY_REVERSED` | 目标还款已被**另一个**撤销 requestId 成功撤销 | 否 |
 | `REJECTED_PAYMENT_NOT_FOUND` | 贷款不存在 / 目标还款不存在 / 未成功受理 / 不属于该贷款 | 否 |
-| `REJECTED_REQUEST_INVALID` | 撤销参数非法（空 requestId、空目标键等）。空值在命令构造处即被拦截为 HTTP 400，本结果码保留给服务层同类判定 | 否 |
+| `REJECTED_REQUEST_INVALID` | 请求本身不合法：请求体为空/空对象、必填字段（`requestId`、`targetPaymentRequestId`）缺失、为 null、空串或纯空白 | 否（不触碰任何存储） |
 | `REJECTED_IDEMPOTENCY_MISMATCH` | 同一撤销 requestId 被不同请求体（别的贷款/别的目标还款）复用 | 否 |
 | `REJECTED_NOT_REVERSIBLE` | 重放后现金守恒/科目恒等式自检不通过的防御性拒绝 | 否 |
 
 注意区分三类“没撤成”：**重放**（同一个撤销请求的副本）、**并发冲突**（同一撤销请求正在处理）、
 **已被撤销**（换了一个撤销请求再来），分别对应三个不同结果码；所有拒绝都只产出
 `PAYMENT_REVERSAL_REJECTED` 事件与业务结果，**不抛服务端错误、不静默改账**。
+
+### 4.3.1 非法与异常输入的统一行为（`REJECTED_REQUEST_INVALID`）
+
+撤销接口对“请求本身不合法”的输入一律返回 `REJECTED_REQUEST_INVALID` 业务结果
+（HTTP 200，与其它拒绝场景同构），**绝不返回 5xx**，也绝不会看起来像撤销成功或已处理过：
+
+- 覆盖范围：请求体整个为空、空对象 `{}`、必填字段缺失、字段为 `null`、空串 `""`、
+  纯空白 `"   "`（`requestId` / `targetPaymentRequestId` 均校验）；`asOf` 缺省时按当日处理，不算非法；
+- 请求体 JSON 语法错误（无法解析）由框架层统一映射为 HTTP 400，同样不是 5xx；
+- 非法请求在**进入任何存储之前**被拦截：不做 CAS 占位、不取贷款锁、不写事件流水，
+  科目余额、挂账、分期状态一律不变；也不落幂等记录——同一 `requestId` 补全参数后
+  重新提交会按正常请求处理（非法请求不算“已受理”，修正后重试是安全的）；
+- 与其它拒绝码的区分：`REJECTED_REQUEST_INVALID` 表示“请求本身没法理解”，
+  `REJECTED_PAYMENT_NOT_FOUND` 表示“请求合法但目标不存在/未成功受理”，
+  `REJECTED_ALREADY_REVERSED` 表示“目标已被他单撤销”，三者不得混用。
+
+**兼容说明**：本次入参校验只作用于“以前会直接抛 500/400 异常”的请求形状，
+对合法请求的处理路径零改动——正常撤销（`REVERSED`）、同键重放（`REPLAYED`）、
+并发冲突（`CONFLICT_CONCURRENT`）、指纹不符（`REJECTED_IDEMPOTENCY_MISMATCH`）、
+换键重复撤销（`REJECTED_ALREADY_REVERSED`）的结果码与账务效果与之前完全一致；
+分摊、逾期账龄、幂等、并发语义均不受影响，撤销后重新对账与事件流水结论保持可复现。
 
 ### 4.4 撤销的幂等与并发协议
 
@@ -282,6 +303,12 @@ curl -s "localhost:8080/api/loans/DEMO-001/reconciliation?asOf=2026-09-23"
 curl -s -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
   -H 'Content-Type: application/json' \
   -d '{"requestId":"rev-1","targetPaymentRequestId":"req-2","asOf":"2026-09-23"}'
+
+# 非法输入：缺 targetPaymentRequestId / 空对象 / 空请求体 → REJECTED_REQUEST_INVALID（HTTP 200，非 5xx，账不变）
+curl -s -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
+  -H 'Content-Type: application/json' -d '{"requestId":"rev-2"}'
+curl -s -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
 ---
@@ -294,7 +321,7 @@ curl -s -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
 mvn test
 ```
 
-共 27 个用例（均为本地、无外部依赖）：
+共 34 个用例（均为本地、无外部依赖）：
 
 - `PaymentAllocationTest`（3）：科目顺序、罚息优先、不足额/超额边界（纯领域）；
 - `PaymentIdempotencyConcurrencyTest`（5）：
@@ -306,6 +333,11 @@ mvn test
 - `PaymentReversalTest`（7）：基础红冲、撤销重放、换键重复撤销、
   **同一撤销 requestId 12 线程并发只生效一次**、贷款/还款不存在与未成功受理等可区分拒绝、
   撤销指纹篡改、撤后重放原还款不复活与多轮“还→撤→还→撤”；
+- `ReversalInvalidInputTest`（7，HTTP 边界）：空请求体/空对象/缺字段、
+  字段为 null/空串/纯空白、JSON 语法错误（400 而非 5xx）、贷款不存在/目标还款不存在/
+  未成功受理、换键重复撤销、合法撤销不被入参校验误拒、
+  **不同撤销 requestId 12 线程并发撤销同一笔还款只生效一次**（其余 `REJECTED_ALREADY_REVERSED`）；
+  每个场景结束都校验科目余额/挂账不变、对账恒等式与现金守恒；
 - `PaymentReversalComplexTest`（5）：超额挂账退回、**原挂账已被后续冲抵使用后仍安全回退**、
   **后续还款后撤销在瀑布中重新就座**、结清并推进账龄后撤销恢复逾期状态与补提罚息、
   两笔挂账+跨期冲抵后撤销其一；每个场景都逐字段比对“该还款从未发生”的影子台账，
