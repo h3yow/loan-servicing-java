@@ -57,6 +57,18 @@ public class ReversalService {
 
     /** 撤销一笔已成功受理的还款；成功、重复撤销、并发冲突、拒绝均返回可区分结果。 */
     public ReversalResult reverse(ReversalCommand command) {
+        // 0) 入参合法性前置拦截：null/空串/纯空白/缺字段等非法输入统一拒绝为
+        //    REJECTED_REQUEST_INVALID。此类请求不进入幂等 CAS、不触碰贷款锁与仓储，
+        //    账上科目余额、挂账、分期状态一律不变，也绝不抛服务端错误。
+        if (command == null) {
+            return rejectInvalid(new ReversalCommand(null, null, null, null),
+                    "撤销命令不能为空（请求体缺失）");
+        }
+        String validationError = command.validationError();
+        if (validationError != null) {
+            return rejectInvalid(command, validationError);
+        }
+
         log.info("[撤销请求] reversalRequestId={}, loanId={}, targetPaymentRequestId={}, asOf={}",
                 command.requestId(), command.loanId(), command.targetPaymentRequestId(), command.asOf());
 
@@ -246,6 +258,35 @@ public class ReversalService {
                 .attr("firstOutcome", firstSnapshot.outcome())
                 .build());
         return buildReplay(firstSnapshot, command);
+    }
+
+    /**
+     * 非法请求的统一拒绝出口：不进入幂等 CAS、不触碰贷款锁与仓储，账一律不动。
+     * 结果特征：outcome=REJECTED_REQUEST_INVALID、succeeded=false、replay=false、
+     * 金额快照全零——既不像是撤销成功，也不像是已处理过的重放。
+     * 仅追加一条 PAYMENT_REVERSAL_REJECTED 审计事件（asOf 缺失时用当前日期兜底，
+     * 事件流水只增不改，不属于账务变动）。
+     */
+    private ReversalResult rejectInvalid(ReversalCommand command, String validationError) {
+        LocalDate asOf = command.asOf() != null ? command.asOf() : LocalDate.now();
+        String message = "撤销请求非法: " + validationError;
+        log.info("[撤销拒绝] reversalRequestId={}, target={}, outcome={}, reason={}",
+                command.requestId(), command.targetPaymentRequestId(),
+                ReversalOutcome.REJECTED_REQUEST_INVALID, message);
+        DomainEvent.Builder event = DomainEvent.builder(EventType.PAYMENT_REVERSAL_REJECTED)
+                .loanId(command.loanId())
+                .businessDate(asOf)
+                .requestId(command.requestId())
+                .summary(message)
+                .attr("outcome", ReversalOutcome.REJECTED_REQUEST_INVALID);
+        if (command.targetPaymentRequestId() != null) {
+            event.attr("reversedPaymentRequestId", command.targetPaymentRequestId());
+        }
+        eventStore.append(event.build());
+        return new ReversalResult(command.requestId(), command.loanId(),
+                command.targetPaymentRequestId(), ReversalOutcome.REJECTED_REQUEST_INVALID,
+                message, Money.ZERO, Money.ZERO, Money.ZERO, Money.ZERO, Money.ZERO,
+                Money.ZERO, LoanStatus.NORMAL, List.of(), asOf, false);
     }
 
     private ReversalResult reject(ReversalCommand command, ReversalOutcome outcome,

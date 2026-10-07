@@ -11,6 +11,7 @@ import com.github.h3yow.loanservicingjava.service.ReconciliationReport;
 import com.github.h3yow.loanservicingjava.service.ReconciliationService;
 import com.github.h3yow.loanservicingjava.service.ReversalService;
 import com.github.h3yow.loanservicingjava.domain.reversal.ReversalCommand;
+import com.github.h3yow.loanservicingjava.domain.reversal.ReversalOutcome;
 import com.github.h3yow.loanservicingjava.domain.reversal.ReversalResult;
 import com.github.h3yow.loanservicingjava.web.dto.AssessRequest;
 import com.github.h3yow.loanservicingjava.web.dto.CreateLoanRequest;
@@ -20,6 +21,7 @@ import com.github.h3yow.loanservicingjava.web.dto.PaymentResultView;
 import com.github.h3yow.loanservicingjava.web.dto.ReversalRequest;
 import com.github.h3yow.loanservicingjava.web.dto.ReversalResultView;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -103,14 +105,24 @@ public class LoanController {
         return PaymentResultView.from(result);
     }
 
-    /** 撤销（冲正）一笔已成功受理的还款：重复撤销、并发冲突、拒绝均为可区分结果码。 */
+    /**
+     * 撤销（冲正）一笔已成功受理的还款：重复撤销、并发冲突、拒绝均为可区分结果码。
+     * 非法输入（请求体缺失/空对象、字段为 null/空串/纯空白）统一返回
+     * HTTP 400 + outcome=REJECTED_REQUEST_INVALID，绝不返回 5xx，也不动账。
+     */
     @PostMapping("/{loanId}/payments/reversal")
-    public ReversalResultView reversePayment(@PathVariable String loanId,
-                                             @RequestBody ReversalRequest request) {
+    public ResponseEntity<ReversalResultView> reversePayment(
+            @PathVariable String loanId,
+            @RequestBody(required = false) ReversalRequest request) {
         ReversalResult result = reversalService.reverse(new ReversalCommand(
-                request.requestId(), loanId, request.targetPaymentRequestId(),
-                request.asOf() == null ? LocalDate.now() : request.asOf()));
-        return ReversalResultView.from(result);
+                request == null ? null : request.requestId(), loanId,
+                request == null ? null : request.targetPaymentRequestId(),
+                request == null || request.asOf() == null ? LocalDate.now() : request.asOf()));
+        ReversalResultView view = ReversalResultView.from(result);
+        if (result.outcome() == ReversalOutcome.REJECTED_REQUEST_INVALID) {
+            return ResponseEntity.badRequest().body(view);
+        }
+        return ResponseEntity.ok(view);
     }
 
     /** 对账：逐科目恒等式核对。 */
@@ -130,5 +142,12 @@ public class LoanController {
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleBadRequest(IllegalArgumentException ex) {
         return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+    }
+
+    /** 请求体无法解析（如畸形 JSON）：统一为 400，绝不冒成 5xx。 */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Map<String, String>> handleUnreadableBody(HttpMessageNotReadableException ex) {
+        return ResponseEntity.badRequest()
+                .body(Map.of("error", "请求体无法解析: " + ex.getMessage()));
     }
 }

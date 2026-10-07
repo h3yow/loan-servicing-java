@@ -191,22 +191,40 @@ SUSPENSE_HELD / SUSPENSE_APPLIED / PAYMENT_REVERSED / PAYMENT_REVERSAL_REJECTED`
 
 ### 4.3 撤销结果码（彼此可区分，禁止合并处理）
 
-| 结果码 | 语义 | 是否改账 |
-| --- | --- | --- |
-| `REVERSED` | 撤销成功，台账已重放为“该笔还款从未发生” | 是（一次性原子替换） |
-| `REPLAYED` | 同一撤销 `requestId` 重复提交，返回首次结果快照 | 否 |
-| `CONFLICT_CONCURRENT` | 同一撤销 `requestId` 的另一请求正在处理中 | 否 |
-| `REJECTED_ALREADY_REVERSED` | 目标还款已被**另一个**撤销 requestId 成功撤销 | 否 |
-| `REJECTED_PAYMENT_NOT_FOUND` | 贷款不存在 / 目标还款不存在 / 未成功受理 / 不属于该贷款 | 否 |
-| `REJECTED_REQUEST_INVALID` | 撤销参数非法（空 requestId、空目标键等）。空值在命令构造处即被拦截为 HTTP 400，本结果码保留给服务层同类判定 | 否 |
-| `REJECTED_IDEMPOTENCY_MISMATCH` | 同一撤销 requestId 被不同请求体（别的贷款/别的目标还款）复用 | 否 |
-| `REJECTED_NOT_REVERSIBLE` | 重放后现金守恒/科目恒等式自检不通过的防御性拒绝 | 否 |
+| 结果码 | 语义 | HTTP 状态 | 是否改账 |
+| --- | --- | --- | --- |
+| `REVERSED` | 撤销成功，台账已重放为“该笔还款从未发生” | 200 | 是（一次性原子替换） |
+| `REPLAYED` | 同一撤销 `requestId` 重复提交，返回首次结果快照 | 200 | 否 |
+| `CONFLICT_CONCURRENT` | 同一撤销 `requestId` 的另一请求正在处理中 | 200 | 否 |
+| `REJECTED_ALREADY_REVERSED` | 目标还款已被**另一个**撤销 requestId 成功撤销 | 200 | 否 |
+| `REJECTED_PAYMENT_NOT_FOUND` | 贷款不存在 / 目标还款不存在 / 未成功受理 / 不属于该贷款 | 200 | 否 |
+| `REJECTED_REQUEST_INVALID` | **请求本身不合法**：缺字段、空对象、空请求体、字段为 null/空串/纯空白 | **400** | 否 |
+| `REJECTED_IDEMPOTENCY_MISMATCH` | 同一撤销 requestId 被不同请求体（别的贷款/别的目标还款）复用 | 200 | 否 |
+| `REJECTED_NOT_REVERSIBLE` | 重放后现金守恒/科目恒等式自检不通过的防御性拒绝 | 200 | 否 |
 
 注意区分三类“没撤成”：**重放**（同一个撤销请求的副本）、**并发冲突**（同一撤销请求正在处理）、
 **已被撤销**（换了一个撤销请求再来），分别对应三个不同结果码；所有拒绝都只产出
 `PAYMENT_REVERSAL_REJECTED` 事件与业务结果，**不抛服务端错误、不静默改账**。
 
-### 4.4 撤销的幂等与并发协议
+### 4.4 非法/异常输入的统一行为（REJECTED_REQUEST_INVALID）
+
+撤销接口对“请求本身不合法”有一致的、可复现的拒绝出口，**绝不返回 5xx**：
+
+- 覆盖形态：请求体整体缺失、空对象 `{}`、`requestId` / `targetPaymentRequestId` 为
+  null、空串 `""`、纯空白 `"   "`，以及服务层直接传入的 null 命令 / null asOf；
+- 返回：**HTTP 400** + 标准撤销结果体，`outcome=REJECTED_REQUEST_INVALID`、
+  `succeeded=false`、`replay=false`、金额快照全零——既不像撤销成功，也不像已处理过的重放，
+  与 `REJECTED_PAYMENT_NOT_FOUND`（贷款/目标还款不存在，HTTP 200）明确区分；
+- 账务影响：**零**。此类请求在幂等 CAS 与贷款锁**之前**被拦截，不占幂等键、不触碰仓储，
+  科目余额、挂账、分期状态一律不变，仅追加一条 `PAYMENT_REVERSAL_REJECTED` 审计事件
+  （事件流水只增不改，不属于账务变动）；
+- 畸形 JSON 等无法解析的请求体由 `HttpMessageNotReadableException` 处理器统一返回
+  HTTP 400 `{"error": ...}`，同样不会冒成 5xx；
+- 实现位置：`ReversalCommand` 不再在构造处抛异常（旧行为会把 null 字段炸成 500），
+  改由 `ReversalService.reverse` 入口用 `validationError()` 统一判定，HTTP 层与服务层
+  走同一条拒绝路径，结果可复现。
+
+### 4.5 撤销的幂等与并发协议
 
 与还款受理完全同构（锁顺序固定为“请求维度 CAS → 贷款维度分段锁”）：
 
@@ -223,7 +241,7 @@ SUSPENSE_HELD / SUSPENSE_APPLIED / PAYMENT_REVERSED / PAYMENT_REVERSAL_REJECTED`
   不会把钱“还回来”；
 - 多次“还→撤→还→撤”往返时，每次重放都会剔除全部历史已撤销还款，旧账不会被“复活”。
 
-### 4.5 因果链与事件
+### 4.6 因果链与事件
 
 撤销成功只追加一条 `PAYMENT_REVERSED`（属性含 `reversedPaymentRequestId`、
 `reversedRequestedAmount`、撤销后三科未还/挂账快照、重放操作数）：
@@ -234,6 +252,22 @@ PAYMENT_APPLIED(requestId=P1)  ──撤销──▶  PAYMENT_REVERSED(requestId
 
 从 `GET /api/loans/{loanId}/events` 可双向核对“哪笔还款、在什么时候、被哪个撤销请求、
 以什么业务日期冲正”；拒绝事件为 `PAYMENT_REVERSAL_REJECTED`（携带结果码与原因）。
+
+### 4.7 兼容说明（非法输入收口对既有语义的影响范围）
+
+- **既有语义一行未改**：`REVERSED / REPLAYED / CONFLICT_CONCURRENT / REJECTED_ALREADY_REVERSED /
+  REJECTED_PAYMENT_NOT_FOUND / REJECTED_IDEMPOTENCY_MISMATCH / REJECTED_NOT_REVERSIBLE`
+  的判定条件、改账行为、事件产出与之前完全一致；正常撤销、同键重放返回首次结果、
+  同一笔还款并发撤销只生效一次等保证全部保持；
+- **唯一的行为变化**：此前会以 500（命令构造处空指针）或不成形错误体结束的非法输入
+  （缺字段、空对象、空请求体、null/空串/纯空白），现在统一为
+  **HTTP 400 + `REJECTED_REQUEST_INVALID` 标准结果体**，且不产生任何账务副作用；
+- **对分摊/逾期/幂等/并发语义无影响**：非法请求在幂等 CAS 与贷款锁之前被拦截，
+  不占用幂等键、不进锁、不触碰仓储；分摊瀑布、逾期账龄认定、还款幂等协议、
+  撤销并发协议的代码路径均未改变；
+- **调用方迁移提示**：若调用方此前把这类 5xx 当作“可重试的系统错误”，现在会收到
+  400 业务拒绝——同样的非法请求体重试多少次结果都一样，应按 `outcome` 分支处理，
+  修正请求体后再提交。
 
 ---
 
@@ -249,7 +283,7 @@ PAYMENT_APPLIED(requestId=P1)  ──撤销──▶  PAYMENT_REVERSED(requestId
 | `POST /api/loans/{loanId}/payments` | 还款受理（body：requestId、amount、asOf） |
 | `POST /api/loans/{loanId}/assess` | 逾期认定/账龄推进（body：asOf），先计提后刷新 |
 | `POST /api/loans/{loanId}/suspense/apply?requestId=&asOf=` | 挂账冲抵 |
-| `POST /api/loans/{loanId}/payments/reversal` | 撤销已受理还款（body：requestId、targetPaymentRequestId、asOf） |
+| `POST /api/loans/{loanId}/payments/reversal` | 撤销已受理还款（body：requestId、targetPaymentRequestId、asOf）；请求非法时 HTTP 400 + `REJECTED_REQUEST_INVALID` |
 | `GET  /api/loans/{loanId}/reconciliation?asOf=` | 对账报告（恒等式核对） |
 | `GET  /api/loans/{loanId}/events` | 事件流水（判定依据追溯） |
 
@@ -282,6 +316,14 @@ curl -s "localhost:8080/api/loans/DEMO-001/reconciliation?asOf=2026-09-23"
 curl -s -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
   -H 'Content-Type: application/json' \
   -d '{"requestId":"rev-1","targetPaymentRequestId":"req-2","asOf":"2026-09-23"}'
+
+# 非法撤销请求：缺 targetPaymentRequestId → HTTP 400 + REJECTED_REQUEST_INVALID（绝不 5xx、不动账）
+curl -s -i -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
+  -H 'Content-Type: application/json' -d '{"requestId":"rev-2"}'
+
+# 空对象 / 空请求体同样是 400 + REJECTED_REQUEST_INVALID
+curl -s -i -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
 ---
@@ -294,7 +336,7 @@ curl -s -X POST localhost:8080/api/loans/DEMO-001/payments/reversal \
 mvn test
 ```
 
-共 27 个用例（均为本地、无外部依赖）：
+共 34 个用例（均为本地、无外部依赖）：
 
 - `PaymentAllocationTest`（3）：科目顺序、罚息优先、不足额/超额边界（纯领域）；
 - `PaymentIdempotencyConcurrencyTest`（5）：
@@ -310,6 +352,13 @@ mvn test
   **后续还款后撤销在瀑布中重新就座**、结清并推进账龄后撤销恢复逾期状态与补提罚息、
   两笔挂账+跨期冲抵后撤销其一；每个场景都逐字段比对“该还款从未发生”的影子台账，
   并校验科目恒等式与现金守恒；
+- `ReversalInvalidInputTest`（7）：撤销非法/异常输入收口——HTTP 层缺字段、空对象 `{}`、
+  空请求体、空串/纯空白/null 字段均为 **400 + `REJECTED_REQUEST_INVALID`** 且账务零变动；
+  服务层 null 命令/null 字段不抛异常统一拒绝；贷款不存在、目标还款不存在/未成功受理
+  落到 `REJECTED_PAYMENT_NOT_FOUND`；合法撤销不被入参校验误伤（REVERSED→REPLAYED→
+  REJECTED_ALREADY_REVERSED 全链路）；**同一笔还款被 12 个不同撤销 requestId 并发撤销，
+  恰 1 次 REVERSED、其余全部 REJECTED_ALREADY_REVERSED，事件流水只有一条真实红冲，
+  账只退一次**；每个场景结束都校验对账恒等式与现金守恒；
 - `EndToEndFlowTest`（1）：逾期→还款→重放→挂账→冲抵→账龄→对账→事件追溯；
 - `ApplicationTests`（1）：Spring 上下文加载。
 
@@ -324,6 +373,16 @@ mvn test
 [关键状态] reversed=1, conflict=..., replayed=...；撤销后 unpaid(P/I/N)=.../.../...
 [对账结果] balanced=true, paid(P/I/N)=..., suspense=..., violations=0
 [账龄快照] status=OVERDUE, bucket=M1, overdueDays=30, basis=asOf(...) > dueDate(...)+grace(3)
+```
+
+非法输入用例同样打印覆盖场景与判定结论，例如：
+
+```
+[覆盖场景] 请求体缺少“要撤销哪一笔还款”这一关键字段
+[判定依据] HTTP=400（非 5xx），outcome=REJECTED_REQUEST_INVALID，succeeded=false，replay=false
+[关键状态] 账快照前=... paidP=166.50 ...；账快照后=...（逐字一致，账务零变动）
+[对账] loanId=... 恒等式平衡 ✔
+[结论] 缺字段 → 400 + REJECTED_REQUEST_INVALID，账务零变动，对账平衡 ✔
 ```
 
 ### 6.3 手工端到端
@@ -344,7 +403,7 @@ domain/loan/Installment.java            分期实体：三类科目余额、罚�
 domain/loan/LedgerOperation.java        台账重放操作（外部还款 / 挂账冲抵，sealed）
 domain/loan/{LoanStatus,InstallmentStatus,Bucket}
 domain/payment/PaymentCommand(Result/Allocation/...)  还款命令、结果码、分摊方案
-domain/reversal/*                       撤销命令/结果/结果码（REVERSED/REPLAYED/各 REJECTED_*）
+domain/reversal/*                       撤销命令（构造不抛异常，validationError 由服务层统一判定）/结果/结果码
 domain/event/{DomainEvent,EventType}    不可变领域事件（判定依据属性，含 PAYMENT_REVERSED 因果链）
 repo/*                                   内存实现：分段锁仓储 / CAS 还款幂等库 / CAS 撤销幂等库 / 事件流水
 service/PaymentService.java             幂等+并发协议、计提→分摊→挂账主流程
